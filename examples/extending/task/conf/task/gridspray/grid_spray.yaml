@@ -1,0 +1,7 @@
+
+grid_size: 10
+n_agents: 4
+num_actions: 5
+spray_capacity: 300
+max_steps: 100
+coverage_size: 1

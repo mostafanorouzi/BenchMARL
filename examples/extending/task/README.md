@@ -3,6 +3,7 @@
 In the following we will see how to:
 1. Create new tasks from a **new** (custom) environment
 2. Create new tasks from an **existing** environment
+3. Wrap a **Gymnasium-based MARL environment** (e.g. `GridSprayEnv`)
 
 ---
 
@@ -21,7 +22,8 @@ If your environment is **not yet wrapped in TorchRL** you have two options:
 | Your env type | Recommended wrapper |
 |---|---|
 | PettingZoo parallel env | [`torchrl.envs.PettingZooWrapper`](https://pytorch.org/rl/stable/reference/generated/torchrl.envs.PettingZooWrapper.html) |
-| Any custom env | Subclass `torchrl.envs.EnvBase` directly |
+| Custom Gymnasium-style MARL env | Subclass `torchrl.envs.EnvBase` directly (see below) |
+| Built from scratch | Subclass `torchrl.envs.EnvBase` directly |
 
 A complete, working example of a custom `EnvBase` environment is provided in
 [`environments/customenv/my_custom_env.py`](environments/customenv/my_custom_env.py).
@@ -144,6 +146,149 @@ defaults:
 
 n_agents: 3
 max_steps: 100
+```
+
+---
+
+## Wrapping a Gymnasium-based MARL environment (GridSprayEnv example)
+
+Many existing MARL environments expose a Gymnasium-style API where
+all agents share a single `step()` call and observations/actions/rewards
+are returned as tuples or arrays:
+
+```python
+# Typical Gymnasium-based MARL env interface
+obs_tuple, rewards, done, truncated, info = env.step(actions)
+obs_tuple, info = env.reset()
+```
+
+This pattern does **not** match TorchRL's `EnvBase` or PettingZoo's parallel
+API, so you need a thin **wrapper class** to bridge them.
+
+The [`GridSprayEnv`](https://github.com/mostafanorouzi/coverage_path_planning_marl)
+environment (a coverage-path-planning scenario) is a concrete example of this
+pattern:
+
+| Property | Value |
+|---|---|
+| `observation_space` | `spaces.Tuple` — one `spaces.Box` per agent |
+| `action_space` | `spaces.MultiDiscrete([5] * n_agents)` |
+| `step()` returns | `(obs_tuple, rewards_array, all_done_bool, False, {})` |
+| `reset()` returns | `(obs_tuple, {})` |
+
+### Files for the GridSprayEnv integration
+
+```
+examples/extending/task/
+├── environments/gridspray/
+│   ├── __init__.py
+│   ├── grid_spray_wrapper.py   ← TorchRL EnvBase wrapper
+│   └── common.py               ← BenchMARL TaskClass + Task enum
+├── conf/task/gridspray/
+│   └── grid_spray.yaml         ← YAML config
+└── run_grid_spray_env.py       ← end-to-end training script
+```
+
+### How the wrapper works
+
+[`environments/gridspray/grid_spray_wrapper.py`](environments/gridspray/grid_spray_wrapper.py)
+wraps any pre-constructed `GridSprayEnv` in a TorchRL `EnvBase`:
+
+```python
+class GridSprayEnvWrapper(EnvBase):
+    AGENTS_GROUP = "agents"
+
+    def __init__(self, gym_env, device="cpu"):
+        super().__init__(device=device, batch_size=[])
+        self._gym_env = gym_env
+        self.n_agents = gym_env.n_agents
+        obs_tuple, _ = gym_env.reset()
+        self._obs_dim = np.asarray(obs_tuple[0]).shape[0]
+        self._make_specs()
+
+    def _make_specs(self):
+        g = self.AGENTS_GROUP
+        # Observations: float vector per agent
+        self.observation_spec = Composite(
+            {g: Composite(
+                observation=Unbounded(shape=[self.n_agents, self._obs_dim]),
+                shape=[self.n_agents],
+            )}, shape=[],
+        )
+        # Discrete actions: integer in [0, num_actions)
+        self.action_spec = Composite(
+            {g: Composite(
+                action=Categorical(n=self.num_actions, shape=[self.n_agents]),
+                shape=[self.n_agents],
+            )}, shape=[],
+        )
+        # Per-agent scalar rewards
+        self.reward_spec = Composite(
+            {g: Composite(
+                reward=Unbounded(shape=[self.n_agents, 1]),
+                shape=[self.n_agents],
+            )}, shape=[],
+        )
+
+    def _reset(self, tensordict=None):
+        obs_tuple, _ = self._gym_env.reset()
+        obs = torch.as_tensor(np.stack([np.asarray(o) for o in obs_tuple]))
+        return TensorDict({
+            self.AGENTS_GROUP: TensorDict({"observation": obs}, batch_size=[self.n_agents]),
+            "done": torch.zeros(1, dtype=torch.bool),
+            "terminated": torch.zeros(1, dtype=torch.bool),
+        }, batch_size=[])
+
+    def _step(self, tensordict):
+        actions = tensordict[self.AGENTS_GROUP, "action"].cpu().numpy().tolist()
+        obs_tuple, rewards_raw, done, _, _ = self._gym_env.step(actions)
+        obs = torch.as_tensor(np.stack([np.asarray(o) for o in obs_tuple]))
+        rewards = torch.as_tensor(np.asarray(rewards_raw)).unsqueeze(-1)  # [n_agents, 1]
+        done_t = torch.tensor([bool(done)], dtype=torch.bool)
+        return TensorDict({
+            self.AGENTS_GROUP: TensorDict(
+                {"observation": obs, "reward": rewards},
+                batch_size=[self.n_agents],
+            ),
+            "done": done_t, "terminated": done_t.clone(),
+        }, batch_size=[])
+```
+
+### How the TaskClass works
+
+[`environments/gridspray/common.py`](environments/gridspray/common.py)
+constructs the `GridSprayEnv`, wraps it, and connects it to BenchMARL:
+
+```python
+class GridSprayClass(TaskClass):
+    def get_env_fun(self, num_envs, continuous_actions, seed, device):
+        from multiagentcoverage.envs.grid_spray_env import GridSprayEnv
+        from multiagentcoverage.envs.states import state_fn
+        from multiagentcoverage.envs.rewards import return_home_reward_fn
+
+        cfg = self.config
+        def _make():
+            gym_env = GridSprayEnv(
+                grid_size=cfg["grid_size"], num_agents=cfg["n_agents"],
+                max_steps=cfg["max_steps"], render=False,
+                state_fn=state_fn, reward_fn=return_home_reward_fn,
+            )
+            return GridSprayEnvWrapper(gym_env=gym_env, device=device)
+        return _make
+
+    def supports_continuous_actions(self): return False
+    def supports_discrete_actions(self):   return True
+    # … other abstract methods …
+```
+
+### Running the GridSprayEnv experiment
+
+```bash
+# Make sure multiagentcoverage is importable:
+export PYTHONPATH=$PYTHONPATH:~/coverage_path_planning_marl
+
+# Run from the repo root:
+python examples/extending/task/run_grid_spray_env.py
 ```
 
 ---

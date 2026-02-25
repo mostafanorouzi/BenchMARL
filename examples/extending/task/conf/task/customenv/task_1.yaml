@@ -2,5 +2,5 @@ defaults:
   - customenv_task_1_config
   - _self_
 
-n_borks: 3
-win_on_dork: True
+n_agents: 3
+max_steps: 100
